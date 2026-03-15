@@ -1,0 +1,40 @@
+---
+# Playbook นี้ทำหน้าที่ติดตั้งและเปิดใช้งาน nginx บน Ubuntu
+- name: 
+Install and configure nginx on Ubuntu
+  hosts: all          
+# รันบนทุกเครื่องใน Inventory
+  become: yes         
+# ใช้สิทธิ์ sudo
+
+  tasks:
+
+    # Task 1: อัปเดต package list ก่อนติดตั้ง
+    - name: Update apt package cache
+      apt:
+        update_cache: yes
+
+    # Task 2: ติดตั้ง nginx
+    - name: Install nginx
+      apt:
+        name: nginx
+        state: present  
+# present=ติดตั้ง, absent=ลบ
+
+    # Task 3: เริ่มต้น nginx และตั้งให้ start ตอน boot
+    - name: Start and enable nginx
+      service:
+        name: nginx
+        state: started
+        enabled: yes
+
+    # Task 4: ตรวจสอบว่า nginx ทำงานจริง
+    - name: Verify nginx is running
+      command: systemctl is-active nginx
+      register: nginx_status
+
+    # Task 5: แสดงสถานะใน AWX log
+    - name: Show nginx status
+      debug:
+        msg: "nginx status: {{ nginx_status.stdout }}"
+
