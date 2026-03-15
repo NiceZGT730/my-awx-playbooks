@@ -6,7 +6,7 @@
 # =============================================================
 
 - name: "Zombie Process Cleanup"
-  hosts: "{{ target_host }}" # AAP จะส่ง hostname มาจาก Dynatrace payload
+  hosts: all
   gather_facts: false # ไม่ต้อง gather facts เพราะประหยัดเวลา
   become: true # ต้องเป็น root เพื่อ kill process ได้
 
