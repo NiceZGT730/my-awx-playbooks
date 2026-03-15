@@ -1,0 +1,264 @@
+# =============================================================
+# Playbook: Zombie Process Cleanup
+# เวอร์ชัน: 1.0
+# ทริกเกอร์: Dynatrace ส่ง Alert มาว่า Process ดับแล้ว
+#            แต่ Port ยังถูกครองอยู่
+# =============================================================
+
+- name: "Zombie Process Cleanup"
+  hosts: "{{ target_host }}" # AAP จะส่ง hostname มาจาก Dynatrace payload
+  gather_facts: false # ไม่ต้อง gather facts เพราะประหยัดเวลา
+  become: true # ต้องเป็น root เพื่อ kill process ได้
+
+  # -------------------------------------------------------
+  # VARIABLES: ค่าตั้งต้นทั้งหมด
+  # ค่าพวกนี้จะถูก Override ได้จาก Extra Variables ใน AWX
+  # -------------------------------------------------------
+  vars:
+    # Port ที่ถูกครองอยู่ (Dynatrace จะส่งมาใน Payload)
+    zombie_port: "{{ port | default('8080') }}"
+
+    # Service ที่ต้องการ Restart หลังจาก kill zombie
+    app_service_name: "{{ service_name | default('myapp') }}"
+
+    # รอกี่วินาทีหลัง SIGTERM ก่อนจะเช็คว่า port ว่างหรือยัง
+    sigterm_wait_seconds: 15
+
+    # รายการ Port ที่ห้าม kill เด็ดขาด (เป็น Safety net)
+    protected_ports:
+      - "22" # SSH - ห้ามแตะ!
+      - "443" # HTTPS
+      - "80" # HTTP
+      - "5432" # PostgreSQL
+      - "3306" # MySQL
+
+    # ServiceNow API ตั้งค่า (เก็บ credential ใน AWX Credential Manager)
+    servicenow_instance: "{{ snow_instance }}"
+    servicenow_incident_id: "{{ incident_id | default('') }}"
+
+  # -------------------------------------------------------
+  # PRE-TASKS: ทำก่อน tasks หลักเสมอ
+  # เป็น Safety check ป้องกันความผิดพลาด
+  # -------------------------------------------------------
+  pre_tasks:
+    - name: "PRE-FLIGHT | ตรวจสอบว่า port ที่รับมาไม่ใช่ port สำคัญ"
+      ansible.builtin.assert:
+        that:
+          # เช็คว่า port ที่จะจัดการ ไม่อยู่ใน protected_ports list
+          - zombie_port not in protected_ports
+        fail_msg: >
+          หยุดทันที! Port {{ zombie_port }} อยู่ใน Protected Port List
+          ไม่อนุญาตให้ทำ Zombie cleanup บน port นี้
+        success_msg: "Port {{ zombie_port }} ผ่าน safety check แล้ว"
+
+    - name: "PRE-FLIGHT | ยืนยันว่า port ถูกใช้งานอยู่จริง"
+      # ใช้ wait_for module เพื่อเช็คว่า port มีอะไรฟัง อยู่จริง
+      ansible.builtin.wait_for:
+        port: "{{ zombie_port }}"
+        host: "localhost"
+        state: started # เช็คว่า port กำลัง "started" (ถูกครองอยู่)
+        timeout: 5 # รอแค่ 5 วินาที ถ้าไม่มีก็แปลว่าไม่มี zombie
+      register: port_check_result
+      ignore_errors: true # ถ้าไม่เจอก็ไม่ fail ทั้ง playbook
+
+    - name: "PRE-FLIGHT | หยุด playbook ถ้าไม่มี zombie จริง"
+      ansible.builtin.meta: end_host
+      when: port_check_result.failed
+      # ถ้า port ว่างแล้ว ไม่ต้องทำอะไร จบ playbook เลย
+
+  # -------------------------------------------------------
+  # TASKS หลัก: ทำตาม Flow ใน Diagram
+  # -------------------------------------------------------
+  tasks:
+    # -------------------------------------------------------
+    # STEP 1: ค้นหา PID ของ Zombie Process
+    # -------------------------------------------------------
+
+    - name: "STEP 1 | ค้นหา PID ที่ครอง port {{ zombie_port }}"
+      # ss คือ socket statistics - ใช้แทน netstat บน Linux รุ่นใหม่
+      # -t = TCP, -l = listening, -n = numeric, -p = show process
+      ansible.builtin.shell: >
+        ss -tlnp sport = :{{ zombie_port }} |
+        grep -oP 'pid=\K[0-9]+' |
+        head -1
+      register: zombie_pid_result
+      changed_when: false # command นี้แค่อ่านข้อมูล ไม่ได้เปลี่ยนแปลงอะไร
+
+    - name: "STEP 1 | แสดงผล PID ที่เจอ (สำหรับ Debug)"
+      ansible.builtin.debug:
+        msg: "พบ Zombie PID: {{ zombie_pid_result.stdout | trim }}"
+      when: zombie_pid_result.stdout | trim | length > 0
+
+    - name: "STEP 1 | หยุดถ้าไม่พบ PID (port อาจว่างไปแล้ว)"
+      ansible.builtin.meta: end_host
+      when: zombie_pid_result.stdout | trim | length == 0
+
+    # เก็บ PID ไว้ใช้ต่อ
+    - name: "STEP 1 | เก็บ PID ลง variable"
+      ansible.builtin.set_fact:
+        zombie_pid: "{{ zombie_pid_result.stdout | trim }}"
+
+    # -------------------------------------------------------
+    # STEP 2: ดูข้อมูล Process ก่อน Kill (สำหรับ Audit Log)
+    # -------------------------------------------------------
+
+    - name: "STEP 2 | เก็บข้อมูล process ก่อน kill (สำหรับ log)"
+      ansible.builtin.shell: "ps -p {{ zombie_pid }} -o pid,ppid,user,cmd --no-headers"
+      register: process_info
+      changed_when: false
+      ignore_errors: true # PID อาจหายไปก่อนที่เราจะ query ได้
+
+    - name: "STEP 2 | แสดงข้อมูล process ที่จะถูก kill"
+      ansible.builtin.debug:
+        msg: "Process info: {{ process_info.stdout | default('ไม่พบข้อมูล') }}"
+
+    # -------------------------------------------------------
+    # STEP 3: Graceful Kill ด้วย SIGTERM ก่อน
+    # SIGTERM = "กรุณาปิดตัวเองซะ" - ให้โอกาส cleanup ก่อน
+    # -------------------------------------------------------
+
+    - name: "STEP 3 | ส่ง SIGTERM (kill -15) ให้ PID {{ zombie_pid }}"
+      ansible.builtin.shell: "kill -15 {{ zombie_pid }}"
+      register: sigterm_result
+      changed_when: true
+      # ignore_errors เพราะบาง PID อาจหายไปแล้วก่อนที่เราจะ kill ได้
+      ignore_errors: true
+
+    - name: "STEP 3 | รอ {{ sigterm_wait_seconds }} วินาที ให้ process ปิดตัว"
+      ansible.builtin.pause:
+        seconds: "{{ sigterm_wait_seconds }}"
+      when: sigterm_result is success
+
+    # -------------------------------------------------------
+    # STEP 4: เช็คว่า Port ว่างแล้วหรือยัง
+    # -------------------------------------------------------
+
+    - name: "STEP 4 | เช็คว่า port {{ zombie_port }} ว่างแล้วหรือยัง"
+      ansible.builtin.shell: >
+        ss -tlnp sport = :{{ zombie_port }} | grep -c LISTEN || true
+      register: port_still_used
+      changed_when: false
+
+    # -------------------------------------------------------
+    # STEP 5: ถ้า SIGTERM ไม่พอ ใช้ SIGKILL (Force kill)
+    # SIGKILL = "ตายเลย!" - OS จะ kill ทันทีไม่มีโอกาส cleanup
+    # -------------------------------------------------------
+
+    - name: "STEP 5 | Force kill ด้วย SIGKILL (kill -9) ถ้า port ยังถูกครอง"
+      ansible.builtin.shell: "kill -9 {{ zombie_pid }}"
+      register: sigkill_result
+      changed_when: true
+      ignore_errors: true
+      # เงื่อนไข: ทำก็ต่อเมื่อ port ยังถูกครองอยู่
+      when: port_still_used.stdout | trim != "0"
+
+    - name: "STEP 5 | รอ 5 วินาทีหลัง SIGKILL"
+      ansible.builtin.pause:
+        seconds: 5
+      when:
+        - port_still_used.stdout | trim != "0"
+        - sigkill_result is success
+
+    # -------------------------------------------------------
+    # STEP 6: ยืนยันว่า Port ว่างแล้ว
+    # -------------------------------------------------------
+
+    - name: "STEP 6 | ยืนยันว่า port {{ zombie_port }} ว่างแล้ว"
+      ansible.builtin.wait_for:
+        port: "{{ zombie_port }}"
+        host: "localhost"
+        state: stopped # รอให้ state เป็น stopped (port ว่าง)
+        timeout: 30
+      register: port_cleared
+
+    # -------------------------------------------------------
+    # STEP 7: Restart Application Service หลัก
+    # -------------------------------------------------------
+
+    - name: "STEP 7 | Restart service {{ app_service_name }}"
+      ansible.builtin.systemd:
+        name: "{{ app_service_name }}"
+        state: restarted
+      register: restart_result
+
+    - name: "STEP 7 | รอให้ service เริ่มต้นสมบูรณ์"
+      ansible.builtin.pause:
+        seconds: 10
+
+    # -------------------------------------------------------
+    # POST-FLIGHT: ยืนยันว่า Service กลับมา Normal แล้ว
+    # -------------------------------------------------------
+
+    - name: "POST-FLIGHT | เช็ค systemd service status"
+      ansible.builtin.systemd:
+        name: "{{ app_service_name }}"
+      register: service_status_check
+
+    - name: "POST-FLIGHT | Fail ถ้า service ยังไม่ active"
+      ansible.builtin.assert:
+        that:
+          - service_status_check.status.ActiveState == "active"
+        fail_msg: >
+          Service {{ app_service_name }} ยังไม่ active!
+          State ปัจจุบัน: {{ service_status_check.status.ActiveState }}
+          ต้องการ Human intervention
+
+    - name: "POST-FLIGHT | ยืนยัน HTTP health check (ถ้ามี)"
+      ansible.builtin.uri:
+        url: "http://localhost:{{ zombie_port }}/health"
+        method: GET
+        status_code: 200
+        timeout: 10
+      register: health_check
+      ignore_errors: true # ไม่ fail ถ้าไม่มี /health endpoint
+
+    - name: "POST-FLIGHT | แสดงผลสรุป"
+      ansible.builtin.debug:
+        msg:
+          - "=== Zombie Process Cleanup สำเร็จ ==="
+          - "Host       : {{ inventory_hostname }}"
+          - "Port       : {{ zombie_port }}"
+          - "Zombie PID : {{ zombie_pid }}"
+          - "Process    : {{ process_info.stdout | default('N/A') }}"
+          - "Service    : {{ app_service_name }} → {{ service_status_check.status.ActiveState }}"
+          - "HTTP Check : {{ health_check.status | default('ไม่มี /health endpoint') }}"
+
+  # -------------------------------------------------------
+  # POST-TASKS: อัพเดต ServiceNow Ticket
+  # ทำเสมอ ไม่ว่าจะสำเร็จหรือล้มเหลว (always)
+  # -------------------------------------------------------
+  post_tasks:
+    - name: "SNOW | อัพเดต ServiceNow incident ว่าแก้ไขสำเร็จ"
+      ansible.builtin.uri:
+        url: "https://{{ servicenow_instance }}.service-now.com/api/now/table/incident/{{ servicenow_incident_id }}"
+        method: PATCH
+        headers:
+          Content-Type: "application/json"
+          Accept: "application/json"
+        # snow_user และ snow_pass เก็บไว้ใน AWX Credential ไม่ใส่ตรงนี้!
+        url_username: "{{ snow_user }}"
+        url_password: "{{ snow_pass }}"
+        force_basic_auth: true
+        body_format: json
+        body:
+          state: "6" # 6 = Resolved ใน ServiceNow
+          close_code: "Solved (Permanently)"
+          close_notes: >
+            Ansible Automation แก้ไขสำเร็จ.
+            Zombie PID {{ zombie_pid }} บน port {{ zombie_port }}
+            ถูก terminate และ service {{ app_service_name }} restart แล้ว.
+            Timestamp: {{ ansible_date_time.iso8601 | default(lookup('pipe','date -u +%Y-%m-%dT%H:%M:%SZ')) }}
+        status_code: 200
+      when:
+        - servicenow_incident_id | length > 0
+        - snow_user is defined
+      ignore_errors: true # ถ้า SNOW update fail ก็ไม่ fail playbook
+
+  # -------------------------------------------------------
+  # HANDLERS: รันเฉพาะเมื่อถูก notify จาก task
+  # -------------------------------------------------------
+  handlers:
+    - name: "restart application"
+      ansible.builtin.systemd:
+        name: "{{ app_service_name }}"
+        state: restarted
