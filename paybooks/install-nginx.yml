@@ -1,6 +1,6 @@
 ---
 # Playbook นี้ทำหน้าที่ติดตั้งและเปิดใช้งาน nginx บน Ubuntu
-- name: จฟInstall and configure nginx on Ubuntu
+- name: Install and configure nginx on Ubuntu
   hosts: all          
 # รันบนทุกเครื่องใน Inventory
   become: yes         
