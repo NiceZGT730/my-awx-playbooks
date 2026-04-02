@@ -1,6 +1,6 @@
 ---
 - name: Test Prompt on Launch Theory
-  hosts: localhost
+  hosts: all
   gather_facts: false
   tasks:
     - name: Show the variable value
