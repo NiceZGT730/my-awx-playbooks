@@ -1,0 +1,8 @@
+---
+- name: Test Prompt on Launch Theory
+  hosts: localhost
+  gather_facts: false
+  tasks:
+    - name: Show the variable value
+      debug:
+        msg: "ค่าที่ระบบได้รับคือ: {{ my_var }}"
